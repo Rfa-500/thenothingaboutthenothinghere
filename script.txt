@@ -18,6 +18,8 @@
     const ON_TARGET      = TARGET_REGEX.test(window.location.href);
     const IN_IFRAME      = window.parent !== window;
     const MSG_TYPE       = 'ejr-aspx-captured';
+    const CURRENT_VERSION = '5.3';
+    const VERSION_URL     = 'https://progren.vercel.app/progen/version.json';
     const SCRIPT_VERSION = '5.3';
     const VERSION_URL    = 'https://progren.vercel.app/';
 
@@ -389,6 +391,12 @@
         letter-spacing:-.3px;
         font-family:'Inter','Segoe UI',system-ui,sans-serif;">Progren</span>
     <button id="ejr-version" title="Click para buscar actualizaciones" style="${btn(
+        'font-size:11px;font-weight:800;letter-spacing:.2px;' +
+        'text-transform:none;color:#bbf7d0;' +
+        'background:rgba(34,197,94,0.16);' +
+        'border-color:rgba(34,197,94,0.45);' +
+        'padding:6px 11px;border-radius:9px;min-height:28px;')}">Version ${CURRENT_VERSION}</button>
+    <span id="ejr-version-spin" style="display:none;color:#bbf7d0;font-size:12px;line-height:1;">⏳</span>
         'font-size:9px;font-weight:700;letter-spacing:.3px;' +
         'text-transform:none;color:#a5b4fc;' +
         'background:rgba(99,102,241,0.12);' +
@@ -568,12 +576,55 @@
         };
 
         // ── Manual version check ────────────────────────────────
+        const versionBtn  = panel.querySelector('#ejr-version');
+        const versionSpin = panel.querySelector('#ejr-version-spin');
         const versionBtn = panel.querySelector('#ejr-version');
         versionBtn.onclick = () => {
             if (updateInfo?.downloadUrl) {
                 window.open(updateInfo.downloadUrl, '_blank', 'noopener,noreferrer');
                 return;
             }
+            versionSpin.style.display = 'inline-block';
+            setVersionBadge('checking', `Version ${CURRENT_VERSION}`);
+            fetch(VERSION_URL, { method: 'GET', cache: 'no-store', credentials: 'omit' })
+                .then(response => {
+                    if (!response.ok) throw new Error(`Version check HTTP ${response.status}`);
+                    return response.json();
+                })
+                .then(info => {
+                    const latest = String(info.latestVersion || '').trim();
+                    const downloadUrl = String(info.downloadUrl || '').trim();
+                    if (!latest || !downloadUrl) throw new Error('Version JSON missing latestVersion or downloadUrl');
+                    if (compareVersions(latest, CURRENT_VERSION) > 0) {
+                        updateInfo = { ...info, latestVersion: latest, downloadUrl };
+                        versionBtn.textContent = `${latest} Update available`;
+                        versionBtn.title = info.message || 'Update available';
+                        setVersionBadge('red');
+                    } else {
+                        versionBtn.textContent = 'No updates found';
+                        versionBtn.title = 'Installed version is current';
+                        setVersionBadge('green');
+                    }
+                })
+                .catch(err => {
+                    console.error('[ejr.aspx Extractor] Version check failed:', err);
+                    updateInfo = null;
+                    versionBtn.textContent = 'Version check failed';
+                    versionBtn.title = 'Version check failed';
+                    setVersionBadge('red');
+                })
+                .finally(() => { versionSpin.style.display = 'none'; });
+        };
+
+        function setVersionBadge(state, text) {
+            if (text) versionBtn.textContent = text;
+            const red = state === 'red';
+            versionBtn.style.background  = red ? 'rgba(239,68,68,0.22)' : 'rgba(34,197,94,0.16)';
+            versionBtn.style.borderColor = red ? 'rgba(239,68,68,0.58)' : 'rgba(34,197,94,0.45)';
+            versionBtn.style.color       = red ? '#fecaca' : '#bbf7d0';
+            if (versionSpin) versionSpin.style.color = red ? '#fecaca' : '#bbf7d0';
+        }
+
             versionBtn.textContent = '⏳';
             fetch(VERSION_URL, { method: 'GET', cache: 'no-store', credentials: 'omit' })
                 .then(r => r.json())
