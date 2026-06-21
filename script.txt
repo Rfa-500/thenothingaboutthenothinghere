@@ -18,6 +18,8 @@
     const ON_TARGET      = TARGET_REGEX.test(window.location.href);
     const IN_IFRAME      = window.parent !== window;
     const MSG_TYPE       = 'ejr-aspx-captured';
+    const CURRENT_VERSION         = '5.3';
+    const UPDATE_VERSION_JSON_URL = 'https://progren.vercel.app/progen/version.json';
     const CURRENT_VERSION = '5.3';
     const VERSION_URL     = 'https://progren.vercel.app/progen/version.json';
     const SCRIPT_VERSION = '5.3';
@@ -586,6 +588,7 @@
             }
             versionSpin.style.display = 'inline-block';
             setVersionBadge('checking', `Version ${CURRENT_VERSION}`);
+            fetch(UPDATE_VERSION_JSON_URL, { method: 'GET', cache: 'no-store', credentials: 'omit' })
             fetch(VERSION_URL, { method: 'GET', cache: 'no-store', credentials: 'omit' })
                 .then(response => {
                     if (!response.ok) throw new Error(`Version check HTTP ${response.status}`);
@@ -681,6 +684,18 @@
         function isSearchFocused() {
             return document.activeElement === searchInput;
         }
+
+        searchInput.addEventListener('focus', () => {
+            if (fullTransparency) {
+                if (ghostEl) { ghostEl.remove(); ghostEl = null; }
+                panel.style.opacity = '1';
+                panel.style.pointerEvents = 'auto';
+            }
+        });
+        searchInput.addEventListener('blur', () => {
+            if (fullTransparency && !mouseInside) activarFullTransparency();
+        });
+
 
         searchInput.addEventListener('focus', () => {
             if (fullTransparency) {
