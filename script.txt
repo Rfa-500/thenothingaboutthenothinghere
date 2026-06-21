@@ -1,0 +1,869 @@
+// ==UserScript==
+// @name         Source code v5.2
+// @namespace    http://tampermonkey.net/
+// @version      5.2
+// @description
+// @match        *://*/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ─────────────────────────────────────────────────────────────
+    // CONFIG
+    // ─────────────────────────────────────────────────────────────
+    const TARGET_REGEX   = /ejr\.aspx(\?.*)?$/i;
+    const ON_TARGET      = TARGET_REGEX.test(window.location.href);
+    const IN_IFRAME      = window.parent !== window;
+    const MSG_TYPE       = 'ejr-aspx-captured';
+
+    // Signature regex for content-based format detection (tipos 2/3, Nav360 y DVLineaTexto).
+    // Used by Mode C, fetch, and XHR interceptors.
+    const CONTENT_REGEX  = /var\s+elementos_palabras\s*=\s*\[|ProNavegacion360|Navegacion360_pnlContenedor|tbTextoMostrarDVLineaTexto/;
+
+    // ─────────────────────────────────────────────────────────────
+    // 1. EXTRACTOR — lee la variable _kod del HTML  (formato original)
+    // ─────────────────────────────────────────────────────────────
+
+    function processCapturedResponse(rawHtml) {
+        if (!rawHtml || typeof rawHtml !== 'string')
+            return { success: false, error: 'Entrada vacía', data: null };
+
+        // ── Formato 2/3 (ConsolaEjerciciosv3): var elementos_palabras = [...] ──
+        // JSON directo, sin codificación base64. Misma estructura Bloques/Preguntas.
+        if (/var\s+elementos_palabras\s*=\s*\[/.test(rawHtml))
+            return processEjrElementosPalabras(rawHtml);
+
+        // ── Formato Nav360 (ProNavegacion360): lectura de artículo / fake-news ──
+        if (/ProNavegacion360|Navegacion360_pnlContenedor/.test(rawHtml))
+            return processNav360(rawHtml);
+
+        // ── Formato DVLineaTexto (Deslizamiento Visual en Línea de Texto) ──
+        // El texto principal viaja en un input oculto (fuente para la animación
+        // JS en pantalla) y las opciones de respuesta son celdas visibles
+        // con id="texto_opcion_N". No expone una marca de respuesta correcta.
+        if (/tbTextoMostrarDVLineaTexto/.test(rawHtml))
+            return processDVLineaTexto(rawHtml);
+
+        // ── Formato 1 (ejr.aspx original): var _kod = "base64..." ──
+        const kodMatch = rawHtml.match(/var\s+_kod\s*=\s*"([A-Za-z0-9+/=\s]+?)"/);
+        if (!kodMatch)
+            return { success: false, error: 'Formato no reconocido', data: null };
+
+        try {
+            const b64   = kodMatch[1].replace(/\s/g, '');
+            const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+            const kod   = JSON.parse(new TextDecoder('utf-8').decode(bytes));
+
+            let instrucciones = '', plantilla = '';
+            try {
+                const doc    = new DOMParser().parseFromString(rawHtml, 'text/html');
+                const descEl = doc.querySelector('.pro-tablero-panel .desc, .pantalla .desc');
+                if (descEl) instrucciones = descEl.textContent.trim();
+                const pm = rawHtml.match(/var\s+plantilla\s*=\s*"([^"]+)"/);
+                if (pm) plantilla = pm[1];
+            } catch (_) {}
+
+            return { success: true, error: null, data: extractFromKod(kod, instrucciones, plantilla) };
+
+        } catch (err) {
+            return { success: false, error: 'Error decodificando _kod: ' + err.message, data: null };
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 2. PARSEO JSON (_kod) — reutilizado por todos los formatos
+    // ─────────────────────────────────────────────────────────────
+
+    function extractFromKod(kod, instrucciones, plantilla) {
+        const textos = [], preguntas = [];
+        for (const c of (Array.isArray(kod) ? kod : [kod])) {
+            for (const b of (c.Bloques || [])) {
+                if (b.Texto?.trim()) textos.push(b.Texto.trim());
+                for (const p of (b.Preguntas || [])) {
+                    const opciones = (p.Respuestas || []).map(r => ({
+                        letra:    r.Cardinal || '?',
+                        texto:    r.Texto    || '',
+                        esImagen: (r.Texto||'').startsWith('img://'),
+                        correcto: r.Correcto === 'S'
+                    }));
+                    const correcta = opciones.find(o => o.correcto);
+                    preguntas.push({
+                        numero: p.Sec || (preguntas.length + 1),
+                        enunciado: p.Texto || '',
+                        opciones,
+                        respuestaCorrecta: correcta ? correcta.letra : '?'
+                    });
+                }
+            }
+        }
+        return { plantilla, instrucciones, textos, preguntas };
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 2b. HELPER: extrae un JSON inline balanceando corchetes/llaves
+    // ─────────────────────────────────────────────────────────────
+
+    function extractInlineJSON(html, varName) {
+        const re = new RegExp('var\\s+' + varName + '\\s*=\\s*');
+        const m  = html.match(re);
+        if (!m) return null;
+        let i = m.index + m[0].length;
+        const first = html[i];
+        if (first !== '[' && first !== '{') return null;
+        const close = first === '[' ? ']' : '}';
+        let depth = 0, inStr = false, esc = false;
+        const start = i;
+        for (; i < html.length; i++) {
+            const c = html[i];
+            if (esc)                 { esc = false; continue; }
+            if (c === '\\' && inStr) { esc = true;  continue; }
+            if (c === '"')           { inStr = !inStr; continue; }
+            if (!inStr) {
+                if (c === first) depth++;
+                if (c === close && --depth === 0) return html.slice(start, i + 1);
+            }
+        }
+        return null;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 2c. FORMATO 2/3: var elementos_palabras (ConsolaEjerciciosv3)
+    //     JSON directo (no base64). La estructura Bloques/Preguntas
+    //     es idéntica al _kod original, por eso reutilizamos extractFromKod.
+    // ─────────────────────────────────────────────────────────────
+
+    function processEjrElementosPalabras(rawHtml) {
+        const jsonStr = extractInlineJSON(rawHtml, 'elementos_palabras');
+        if (!jsonStr)
+            return { success: false, error: 'Variable elementos_palabras no encontrada', data: null };
+        try {
+            const kod = JSON.parse(jsonStr);
+            let plantilla = '', instrucciones = '';
+            const pm = rawHtml.match(/var\s+plantilla\s*=\s*"([^"]+)"/);
+            if (pm) plantilla = pm[1];
+            try {
+                const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
+                const el  = doc.querySelector('.textoInstruccionesEjercicioCaja');
+                if (el) instrucciones = el.textContent.trim();
+            } catch (_) {}
+            return {
+                success: true, error: null,
+                data: extractFromKod(Array.isArray(kod) ? kod : [kod], instrucciones, plantilla)
+            };
+        } catch (err) {
+            return { success: false, error: 'Error en elementos_palabras: ' + err.message, data: null };
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 2d. FORMATO NAV360: ProNavegacion360 (lectura / fake-news)
+    //     Fase de texto  → extrae título, fecha y cuerpo del artículo.
+    //     Fase de pregunta (post-postback) → extrae .respuestaPreguntaTema.
+    // ─────────────────────────────────────────────────────────────
+
+    function processNav360(rawHtml) {
+        try {
+            const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
+
+            // ── Fase de texto (artículo) ──────────────────────────
+            const titulo  = (doc.querySelector('.titulo')?.textContent  || '').trim();
+            const fecha   = (doc.getElementById('fecha')?.textContent   || '').trim();
+            const hfTexto = (doc.getElementById('hfTexto')?.value       || '').trim();
+            const hfPalab = (doc.getElementById('hfPalabrasClave')?.value || '').trim();
+
+            // Limpia enlaces markdown (label||url) → label
+            const artText = hfTexto.replace(/\(([^|)]+)\|\|[^)]+\)/g, '$1').trim()
+                         || (doc.querySelector('#fkApp .parrafo')?.textContent || '').trim();
+
+            const textos = [];
+            if (titulo || artText) {
+                const partes = [];
+                if (titulo)  partes.push('📰 ' + titulo);
+                if (fecha)   partes.push('🗓  ' + fecha);
+                if (artText) partes.push(artText);
+                textos.push(partes.join('\n'));
+            }
+
+            // ── Fase de pregunta (aparece tras el postback «Responder») ──
+            const preguntas = [];
+            const respEls   = doc.querySelectorAll('.respuestaPreguntaTema');
+            if (respEls.length > 0) {
+                const qEl = doc.querySelector(
+                    '[id*="preguntaTema"],[class*="textoPregunta"],.bloque .pregunta'
+                );
+                const enunciado = (qEl?.textContent || '').trim();
+                const opciones  = Array.from(respEls).map((el, i) => ({
+                    letra:    el.getAttribute('data-cardinal') || String.fromCharCode(65 + i),
+                    texto:    el.textContent.trim(),
+                    esImagen: false,
+                    correcto: el.classList.contains('S')
+                }));
+                const correcta = opciones.find(o => o.correcto);
+                preguntas.push({
+                    numero: 1, enunciado, opciones,
+                    respuestaCorrecta: correcta ? correcta.letra : '?'
+                });
+            }
+
+            if (!textos.length && !preguntas.length)
+                return { success: false, error: 'Nav360: sin contenido visible aún', data: null };
+
+            return {
+                success: true, error: null,
+                data: { plantilla: 'Navegacion360', instrucciones: '', textos, preguntas }
+            };
+        } catch (err) {
+            return { success: false, error: 'Nav360 error: ' + err.message, data: null };
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 2e. FORMATO DVLineaTexto: Deslizamiento Visual en Línea de Texto
+    //     El texto que el usuario debe leer se entrega en un <input>
+    //     oculto (fuente de datos para la animación DVLineaTexto*.js que
+    //     lo muestra en pantalla), y la pregunta final ofrece opciones
+    //     visibles (celdas con id="texto_opcion_N"). El marcado no expone
+    //     ninguna marca de respuesta correcta, por lo que se reporta '?'.
+    // ─────────────────────────────────────────────────────────────
+
+    function processDVLineaTexto(rawHtml) {
+        try {
+            const doc = new DOMParser().parseFromString(rawHtml, 'text/html');
+
+            const tituloEl = doc.querySelector('[id$="lblInstruccionesTitulo"]');
+            const textoEl  = doc.querySelector('[id$="lblInstruccionesTexto"]');
+            const titulo   = (tituloEl?.textContent || '').trim();
+            const instrTxt = (textoEl?.textContent  || '').trim();
+            const instrucciones = [titulo, instrTxt].filter(Boolean).join(' — ');
+
+            const plantillaEl = doc.querySelector('[id$="hfPlantilla"]');
+            const plantilla   = (plantillaEl?.value || 'DVLineaTexto').trim();
+
+            const mainInput = doc.querySelector('input[id$="tbTextoMostrarDVLineaTexto"]');
+            const mainText  = (mainInput?.value || '').trim();
+            const textos    = mainText ? [mainText] : [];
+
+            const qEl = doc.querySelector('label.textoPreguntaEjercicio');
+            const enunciado = (qEl?.textContent || '').trim();
+
+            const optEls   = Array.from(doc.querySelectorAll('[id^="texto_opcion_"]'));
+            const opciones = optEls.map((el, i) => ({
+                letra:    String.fromCharCode(65 + i),
+                texto:    el.textContent.trim(),
+                esImagen: false,
+                correcto: false
+            }));
+
+            const preguntas = (enunciado || opciones.length)
+                ? [{ numero: 1, enunciado, opciones, respuestaCorrecta: '?' }]
+                : [];
+
+            if (!textos.length && !preguntas.length)
+                return { success: false, error: 'DVLineaTexto: sin contenido visible aún', data: null };
+
+            return {
+                success: true, error: null,
+                data: { plantilla, instrucciones, textos, preguntas }
+            };
+        } catch (err) {
+            return { success: false, error: 'DVLineaTexto error: ' + err.message, data: null };
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 3. RENDERIZADO
+    // ─────────────────────────────────────────────────────────────
+
+    function renderData(data) {
+        if (!data) return '(sin datos)';
+        const L = [];
+        if (data.plantilla) {
+            L.push('═══════════════════════════════');
+            L.push('  Plantilla: ' + data.plantilla);
+            L.push('═══════════════════════════════');
+        }
+        if (data.instrucciones) {
+            L.push(''); L.push('📋 INSTRUCCIONES'); L.push('───────────────');
+            L.push(data.instrucciones);
+        }
+        (data.textos || []).forEach((t, i) => {
+            L.push('');
+            L.push(data.textos.length > 1 ? `📄 TEXTO ${i + 1}` : '📄 TEXTO');
+            L.push('───────────────');
+            L.push(t);
+        });
+        (data.preguntas || []).forEach(p => {
+            L.push(''); L.push(`❓ PREGUNTA ${p.numero}`); L.push('───────────────');
+            if (p.enunciado) L.push(p.enunciado);
+            L.push('');
+            p.opciones.forEach(o => {
+                const marca = o.correcto ? ' ✅' : '';
+                const desc  = o.esImagen ? `[Gráfica ${o.letra}]${marca}` : `${o.texto}${marca}`;
+                L.push(`  ${o.letra}.  ${desc}`);
+            });
+            L.push('');
+            L.push(`  🎯 RESPUESTA CORRECTA: ${p.respuestaCorrecta}`);
+        });
+        return L.join('\n');
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 4. UI  ·  redesigned — only visual layer changed
+    // ─────────────────────────────────────────────────────────────
+
+    let panelEl, statusEl, statusDotEl, urlEl, outputEl;
+
+    function buildUI() {
+        if (panelEl || IN_IFRAME) return;
+
+        // ── Estado interno ────────────────────────────────────────
+        let collapsed  = false;
+        let showJson   = false;
+        let lastResult = null;
+        let rawText    = '';
+        let srMatches  = [];
+        let srIdx      = 0;
+        let invisible  = false;
+        let ghostEl    = null;
+
+        // ── Button style helper ───────────────────────────────────
+        const btn = (extra = '') =>
+            `display:inline-flex;align-items:center;justify-content:center;gap:3px;` +
+            `background:rgba(255,255,255,0.05);color:#94a3b8;` +
+            `border:1px solid rgba(255,255,255,0.09);border-radius:8px;` +
+            `padding:5px 9px;cursor:pointer;font-size:11px;font-family:inherit;` +
+            `line-height:1.2;transition:background .15s,color .15s,border-color .15s,box-shadow .15s;${extra}`;
+
+        // ── Panel ─────────────────────────────────────────────────
+        const panel = document.createElement('div');
+        Object.assign(panel.style, {
+            position:      'fixed',
+            bottom:        '20px',
+            right:         '20px',
+            width:         '500px',
+            maxHeight:     '78vh',
+            background:    '#0c0e1a',
+            color:         '#e2e8f0',
+            fontFamily:    '"Consolas","Courier New",monospace',
+            fontSize:      '12px',
+            border:        '1px solid rgba(99,102,241,0.22)',
+            borderRadius:  '16px',
+            boxShadow:     '0 0 0 1px rgba(99,102,241,0.07),' +
+                           '0 0 40px rgba(99,102,241,0.07),' +
+                           '0 24px 64px rgba(0,0,0,0.96)',
+            zIndex:        '2147483647',
+            display:       'flex',
+            flexDirection: 'column',
+            overflow:      'hidden',
+            userSelect:    'none',
+            transition:    'opacity 0.25s ease, transform 0.25s ease',
+            opacity:       '0.18',
+        });
+
+        panel.innerHTML = `
+<!-- ── HEADER ─────────────────────────────────────────────── -->
+<div id="ejr-hdr" style="
+    background:linear-gradient(135deg,#111528 0%,#0e1020 100%);
+    padding:12px 14px;cursor:move;
+    display:flex;justify-content:space-between;align-items:center;
+    border-bottom:1px solid rgba(255,255,255,0.07);flex-shrink:0;">
+
+  <!-- Brand -->
+  <div style="display:flex;align-items:center;gap:9px;">
+    <div id="ejr-pulse-dot" style="
+        width:7px;height:7px;border-radius:50%;flex-shrink:0;
+        background:linear-gradient(135deg,#6366f1,#8b5cf6);
+        box-shadow:0 0 8px rgba(99,102,241,0.95);"></div>
+    <span style="
+        font-weight:700;font-size:14px;color:#fff;
+        letter-spacing:-.3px;
+        font-family:'Inter','Segoe UI',system-ui,sans-serif;">Progren</span>
+    <span style="
+        font-size:9px;font-weight:700;letter-spacing:.8px;
+        text-transform:uppercase;color:#a5b4fc;
+        background:rgba(99,102,241,0.12);
+        border:1px solid rgba(99,102,241,0.28);
+        padding:2px 7px;border-radius:5px;">BETA</span>
+  </div>
+
+  <!-- Actions -->
+  <div style="display:flex;gap:5px;align-items:center;">
+    <button id="ejr-copy"   title="Copiar texto"  style="${btn()}">📋</button>
+    <button id="ejr-json"   title="Ver JSON raw"   style="${btn()}">{ }</button>
+    <button id="ejr-gear"   title="Ajustes"        style="${btn()}">⚙</button>
+    <div style="width:1px;height:16px;background:rgba(255,255,255,0.1);
+                margin:0 1px;flex-shrink:0;"></div>
+    <button id="ejr-toggle" title="Minimizar"      style="${btn()}">─</button>
+    <button id="ejr-kill"   title="Cerrar"         style="${btn(
+        'background:rgba(239,68,68,0.1);' +
+        'border-color:rgba(239,68,68,0.25);' +
+        'color:#f87171;')}">✕</button>
+  </div>
+</div>
+
+<!-- ── SETTINGS ───────────────────────────────────────────── -->
+<div id="ejr-settings" style="
+    display:none;background:#0f1020;padding:10px 14px;
+    border-bottom:1px solid rgba(255,255,255,0.06);flex-shrink:0;">
+  <label style="display:flex;align-items:center;gap:10px;
+                cursor:pointer;color:#94a3b8;font-size:11px;">
+    <input type="checkbox" id="ejr-inv-chk"
+           style="cursor:pointer;accent-color:#6366f1;width:14px;height:14px;">
+    <span>Modo invisible — reaparece al pasar el cursor</span>
+  </label>
+</div>
+
+<!-- ── SEARCH BAR ─────────────────────────────────────────── -->
+<div id="ejr-search-bar" style="
+    background:#0e1020;padding:7px 12px;
+    border-bottom:1px solid rgba(255,255,255,0.06);
+    display:flex;align-items:center;gap:6px;flex-shrink:0;">
+
+  <div style="
+      flex:1;display:flex;align-items:center;
+      background:rgba(255,255,255,0.04);
+      border:1px solid rgba(255,255,255,0.08);
+      border-radius:8px;padding:0 10px;gap:6px;">
+    <span style="color:#334155;font-size:11px;flex-shrink:0;line-height:1;">🔍</span>
+    <input id="ejr-search" type="text"
+           placeholder="Buscar en el contenido..."
+           style="flex:1;background:transparent;color:#e2e8f0;border:none;
+                  padding:5px 0;font-size:11px;font-family:inherit;
+                  outline:none;min-width:0;">
+  </div>
+
+  <span id="ejr-sr-count" style="
+      color:#475569;font-size:10px;min-width:38px;
+      text-align:center;white-space:nowrap;">─</span>
+  <button id="ejr-sr-prev" title="Anterior"  style="${btn()}">▲</button>
+  <button id="ejr-sr-next" title="Siguiente" style="${btn()}">▼</button>
+  <button id="ejr-sr-clr"  title="Limpiar"   style="${btn()}">✕</button>
+</div>
+
+<!-- ── STATUS BAR ─────────────────────────────────────────── -->
+<div id="ejr-sbar" style="
+    background:#0b0d18;padding:6px 14px;font-size:10px;
+    color:#475569;flex-shrink:0;
+    border-bottom:1px solid rgba(255,255,255,0.05);
+    display:flex;align-items:center;gap:7px;">
+  <div id="ejr-status-dot" style="
+      width:6px;height:6px;border-radius:50%;
+      background:#1e293b;flex-shrink:0;
+      transition:background 0.3s;"></div>
+  <span id="ejr-status">Esperando respuesta...</span>
+</div>
+
+<!-- ── OUTPUT BODY ────────────────────────────────────────── -->
+<div id="ejr-body" style="
+    padding:12px 14px;overflow:auto;flex:1;background:#0b0d18;">
+  <div id="ejr-url" style="
+      color:#818cf8;font-size:10px;word-break:break-all;
+      margin-bottom:10px;display:none;padding:6px 10px;
+      background:rgba(99,102,241,0.07);
+      border:1px solid rgba(99,102,241,0.18);
+      border-radius:7px;"></div>
+  <pre id="ejr-output" style="
+      white-space:pre-wrap;word-break:break-word;margin:0;
+      line-height:1.75;color:#e2e8f0;background:transparent;
+      font-family:'Consolas','Courier New',monospace;
+      font-size:12px;"></pre>
+</div>`;
+
+        // ── Injected CSS ──────────────────────────────────────────
+        const ejrStyle = document.createElement('style');
+        ejrStyle.textContent = `
+            @keyframes ejr-pulse-glow {
+                0%,100% { box-shadow: 0 0 6px rgba(99,102,241,0.9); }
+                50%     { box-shadow: 0 0 14px rgba(139,92,246,1),
+                                      0 0 24px rgba(99,102,241,0.5); }
+            }
+            #ejr-pulse-dot { animation: ejr-pulse-glow 2.4s ease-in-out infinite; }
+
+            #ejr-aspx-panel, #ejr-aspx-panel * { box-sizing: border-box !important; }
+
+            #ejr-body    { background: #0b0d18 !important; }
+            #ejr-output  { background: transparent !important;
+                           color: #e2e8f0 !important;
+                           font-family: "Consolas","Courier New",monospace !important;
+                           font-size: 12px !important;
+                           line-height: 1.75 !important; }
+            #ejr-output mark.ejr-hl {
+                border-radius: 3px !important;
+                padding: 0 2px !important; }
+
+            #ejr-search             { color: #e2e8f0 !important; }
+            #ejr-search::placeholder{ color: #334155 !important; }
+            #ejr-settings           { color: #94a3b8 !important; }
+
+            /* Button hover */
+            #ejr-aspx-panel button:hover {
+                background:    rgba(255,255,255,0.09) !important;
+                border-color:  rgba(255,255,255,0.16) !important;
+                color:         #e2e8f0                !important;
+                box-shadow:    0 0 0 1px rgba(255,255,255,0.05) !important; }
+
+            #ejr-kill:hover {
+                background:   rgba(239,68,68,0.2)  !important;
+                border-color: rgba(239,68,68,0.45) !important;
+                color:        #fca5a5               !important;
+                box-shadow:   0 0 8px rgba(239,68,68,0.2) !important; }
+
+            /* Scrollbar */
+            #ejr-body::-webkit-scrollbar       { width: 4px; }
+            #ejr-body::-webkit-scrollbar-track  { background: transparent; }
+            #ejr-body::-webkit-scrollbar-thumb  {
+                background:    rgba(99,102,241,0.35);
+                border-radius: 4px; }
+        `;
+        document.head.appendChild(ejrStyle);
+
+        document.body.appendChild(panel);
+        panel.id    = 'ejr-aspx-panel';
+        panelEl     = panel;
+        statusEl    = panel.querySelector('#ejr-status');
+        statusDotEl = panel.querySelector('#ejr-status-dot');
+        urlEl       = panel.querySelector('#ejr-url');
+        outputEl    = panel.querySelector('#ejr-output');
+
+        const bodyEl      = panel.querySelector('#ejr-body');
+        const settingsEl  = panel.querySelector('#ejr-settings');
+        const searchInput = panel.querySelector('#ejr-search');
+        const srCount     = panel.querySelector('#ejr-sr-count');
+
+        // ── Hover opacity ─────────────────────────────────────────
+        panel.addEventListener('mouseenter', () => { if (!invisible) panel.style.opacity = '1'; });
+        panel.addEventListener('mouseleave', () => { if (!invisible) panel.style.opacity = '0.18'; });
+
+        // ── Copiar ────────────────────────────────────────────────
+        panel.querySelector('#ejr-copy').onclick = () => {
+            if (!rawText) return;
+            (navigator.clipboard?.writeText(rawText) || Promise.reject())
+                .then(done).catch(() => {
+                    const ta = document.createElement('textarea');
+                    ta.value = rawText; document.body.appendChild(ta);
+                    ta.select(); document.execCommand('copy');
+                    document.body.removeChild(ta); done();
+                });
+            function done() {
+                statusEl.textContent = '✅ Copiado al portapapeles';
+                setTimeout(() => setStatus(lastResult), 1800);
+            }
+        };
+
+        // ── JSON toggle ───────────────────────────────────────────
+        panel.querySelector('#ejr-json').onclick = () => {
+            if (!lastResult?.success) return;
+            showJson = !showJson;
+            panel.querySelector('#ejr-json').textContent = showJson ? '📖' : '{ }';
+            setOutputText(showJson
+                ? JSON.stringify(lastResult.data, null, 2)
+                : renderData(lastResult.data));
+        };
+
+        // ── Gear: abrir / cerrar config ───────────────────────────
+        panel.querySelector('#ejr-gear').onclick = () => {
+            const open    = settingsEl.style.display === 'none';
+            const gearBtn = panel.querySelector('#ejr-gear');
+            settingsEl.style.display  = open ? 'block' : 'none';
+            gearBtn.style.background  = open ? 'rgba(99,102,241,0.15)' : 'rgba(255,255,255,0.05)';
+            gearBtn.style.borderColor = open ? 'rgba(99,102,241,0.35)' : 'rgba(255,255,255,0.09)';
+            gearBtn.style.color       = open ? '#a5b4fc'                : '#94a3b8';
+        };
+
+        // ── Modo invisible ────────────────────────────────────────
+        panel.querySelector('#ejr-inv-chk').onchange = function () {
+            invisible = this.checked;
+            invisible ? activarInvisible() : desactivarInvisible();
+        };
+
+        function activarInvisible() {
+            panel.style.opacity       = '0';
+            panel.style.pointerEvents = 'none';
+            if (ghostEl) ghostEl.remove();
+            ghostEl = document.createElement('div');
+            const r = panel.getBoundingClientRect();
+            Object.assign(ghostEl.style, {
+                position: 'fixed', zIndex: '2147483646',
+                left: r.left + 'px', top: r.top + 'px',
+                width: r.width + 'px', height: r.height + 'px',
+                cursor: 'default',
+            });
+            ghostEl.addEventListener('mouseenter', mostrarPanel);
+            document.body.appendChild(ghostEl);
+        }
+
+        function mostrarPanel() {
+            if (ghostEl) { ghostEl.remove(); ghostEl = null; }
+            panel.style.opacity       = '1';
+            panel.style.pointerEvents = 'auto';
+            panel.addEventListener('mouseleave', volverAInvisible, { once: true });
+        }
+
+        function volverAInvisible() {
+            if (!invisible) return;
+            activarInvisible();
+        }
+
+        function desactivarInvisible() {
+            panel.style.opacity       = '0.18';
+            panel.style.pointerEvents = 'auto';
+            if (ghostEl) { ghostEl.remove(); ghostEl = null; }
+        }
+
+        // ── Minimizar ─────────────────────────────────────────────
+        panel.querySelector('#ejr-toggle').onclick = () => {
+            collapsed = !collapsed;
+            [bodyEl, settingsEl, panel.querySelector('#ejr-sbar'),
+             panel.querySelector('#ejr-search-bar')].forEach(el => {
+                if (el) el.style.display = collapsed ? 'none'
+                    : (el === bodyEl || el === settingsEl ? 'block' : 'flex');
+            });
+            panel.querySelector('#ejr-toggle').textContent = collapsed ? '□' : '─';
+        };
+
+        // ── Autodestruir ──────────────────────────────────────────
+        panel.querySelector('#ejr-kill').onclick = () => {
+            panel.style.opacity   = '0';
+            panel.style.transform = 'scale(0.9)';
+            if (ghostEl) { ghostEl.remove(); ghostEl = null; }
+            setTimeout(() => {
+                panel.remove();
+                panelEl = statusEl = urlEl = outputEl = statusDotEl = null;
+            }, 280);
+        };
+
+        // ── Arrastrar ─────────────────────────────────────────────
+        const hdr = panel.querySelector('#ejr-hdr');
+        let ox = 0, oy = 0, dragging = false;
+        hdr.addEventListener('mousedown', e => {
+            dragging = true;
+            const r = panel.getBoundingClientRect();
+            ox = e.clientX - r.left; oy = e.clientY - r.top;
+        });
+        document.addEventListener('mousemove', e => {
+            if (!dragging) return;
+            panel.style.left   = (e.clientX - ox) + 'px';
+            panel.style.top    = (e.clientY - oy) + 'px';
+            panel.style.right  = 'auto';
+            panel.style.bottom = 'auto';
+            if (ghostEl) {
+                ghostEl.style.left = panel.style.left;
+                ghostEl.style.top  = panel.style.top;
+            }
+        });
+        document.addEventListener('mouseup', () => { dragging = false; });
+
+        // ── Buscador ──────────────────────────────────────────────
+        function escRx(s)   { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+        function escHtml(s) {
+            return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+
+        function applySearch(query) {
+            if (!query) {
+                outputEl.textContent = rawText;
+                srMatches = []; srIdx = 0;
+                srCount.textContent = '─';
+                return;
+            }
+            const escaped   = escHtml(rawText);
+            const safeQuery = escRx(escHtml(query));
+            const re        = new RegExp(safeQuery, 'gi');
+            outputEl.innerHTML = escaped.replace(re,
+                m => `<mark class="ejr-hl" style="background:#854d0e;color:#fef08a;border-radius:3px;padding:0 2px;">${m}</mark>`
+            );
+            srMatches = Array.from(outputEl.querySelectorAll('.ejr-hl'));
+            srIdx = srMatches.length > 0 ? 0 : -1;
+            resaltarActual();
+        }
+
+        function resaltarActual() {
+            srMatches.forEach((m, i) => {
+                m.style.background = (i === srIdx) ? '#d97706' : '#854d0e';
+                m.style.color      = (i === srIdx) ? '#fff'    : '#fef08a';
+            });
+            if (srIdx >= 0 && srMatches[srIdx]) {
+                srMatches[srIdx].scrollIntoView({ block: 'center', behavior: 'smooth' });
+                srCount.textContent = `${srIdx + 1}/${srMatches.length}`;
+            } else {
+                srCount.textContent = srMatches.length === 0 && searchInput.value ? '0/0' : '─';
+            }
+        }
+
+        searchInput.addEventListener('input', () => applySearch(searchInput.value.trim()));
+
+        panel.querySelector('#ejr-sr-prev').onclick = () => {
+            if (!srMatches.length) return;
+            srIdx = (srIdx - 1 + srMatches.length) % srMatches.length;
+            resaltarActual();
+        };
+        panel.querySelector('#ejr-sr-next').onclick = () => {
+            if (!srMatches.length) return;
+            srIdx = (srIdx + 1) % srMatches.length;
+            resaltarActual();
+        };
+        panel.querySelector('#ejr-sr-clr').onclick = () => {
+            searchInput.value    = '';
+            outputEl.textContent = rawText;
+            srMatches = []; srIdx = 0; srCount.textContent = '─';
+        };
+
+        // ── Helpers expuestos al panel ────────────────────────────
+        function setOutputText(text) {
+            rawText = text;
+            applySearch(searchInput.value.trim());
+        }
+
+        panel.__setResult = r => { lastResult = r; };
+        panel.__setOutput = setOutputText;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 5. STATUS Y SHOW RESULT
+    // ─────────────────────────────────────────────────────────────
+
+    function setStatus(result) {
+        if (!statusEl) return;
+        if (!result) {
+            statusEl.textContent = 'Esperando respuesta...';
+            statusEl.style.color = '#475569';
+            if (statusDotEl) statusDotEl.style.background = '#1e293b';
+            return;
+        }
+        statusEl.textContent = result.success
+            ? `Capturado · ${new Date().toLocaleTimeString()}`
+            : result.error;
+        statusEl.style.color = result.success ? '#22c55e' : '#f87171';
+        if (statusDotEl) statusDotEl.style.background = result.success ? '#22c55e' : '#ef4444';
+    }
+
+    function showResult(url, result) {
+        if (IN_IFRAME) return;
+        if (!panelEl) return;
+        panelEl.__setResult(result);
+        if (url) { urlEl.textContent = '🔗 ' + url; urlEl.style.display = 'block'; }
+        setStatus(result);
+        const text = result.success ? renderData(result.data) : '⚠ ' + result.error;
+        panelEl.__setOutput(text);
+        outputEl.style.color = result.success ? '#e2e8f0' : '#f87171';
+        console.log('[ejr.aspx Extractor]', result);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 6. ESPERAR BODY
+    // ─────────────────────────────────────────────────────────────
+
+    function whenBodyReady(fn) {
+        if (IN_IFRAME) return;
+        if (document.body) { fn(); return; }
+        document.addEventListener('DOMContentLoaded', fn, { once: true });
+        const obs = new MutationObserver(() => { if (document.body) { obs.disconnect(); fn(); } });
+        obs.observe(document.documentElement, { childList: true });
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 7. MODO A — EN ejr.aspx → leer _kod del DOM
+    // ─────────────────────────────────────────────────────────────
+
+    if (ON_TARGET) {
+        function parsePage() {
+            const result = processCapturedResponse(document.documentElement.outerHTML);
+            const url    = window.location.href;
+            console.log('[ejr.aspx Extractor] Página parseada:', result);
+            if (IN_IFRAME) {
+                try { window.parent.postMessage({ type: MSG_TYPE, url, result }, '*'); }
+                catch (e) { console.warn('[ejr.aspx Extractor] postMessage falló:', e); }
+            } else {
+                whenBodyReady(() => { buildUI(); showResult(url, result); });
+            }
+        }
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', parsePage, { once: true });
+        } else {
+            parsePage();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // 8. MODO B — Ventana TOP: iframes + XHR/fetch
+    // ─────────────────────────────────────────────────────────────
+
+    if (!IN_IFRAME) {
+        window.addEventListener('message', e => {
+            if (e.data?.type !== MSG_TYPE) return;
+            if (!panelEl) buildUI();
+            showResult(e.data.url, e.data.result);
+        });
+
+        const origFetch = window.fetch.bind(window);
+        window.fetch = function (...args) {
+            const req = args[0];
+            const url = typeof req === 'string' ? req : (req?.url ?? '');
+            return origFetch(...args).then(response => {
+                if (TARGET_REGEX.test(url)) {
+                    // Original: ejr.aspx URL
+                    response.clone().text().then(body =>
+                        showResult(url, processCapturedResponse(body)));
+                } else {
+                    // Nuevos formatos: verificar cuerpo de respuestas HTML
+                    const ct = response.headers?.get?.('content-type') || '';
+                    if (ct.includes('text/html')) {
+                        response.clone().text().then(body => {
+                            if (!CONTENT_REGEX.test(body)) return;
+                            const r = processCapturedResponse(body);
+                            if (r.success) showResult(url, r);
+                        });
+                    }
+                }
+                return response;
+            });
+        };
+
+        const OrigXHR = window.XMLHttpRequest;
+        function PatchedXHR() {
+            const xhr = new OrigXHR();
+            let reqUrl = '';
+            xhr.open = (m, u, ...r) => { reqUrl = u; return OrigXHR.prototype.open.call(xhr, m, u, ...r); };
+            xhr.addEventListener('readystatechange', () => {
+                if (xhr.readyState !== 4) return;
+                if (TARGET_REGEX.test(reqUrl)) {
+                    // Original: ejr.aspx URL
+                    showResult(reqUrl, processCapturedResponse(xhr.responseText));
+                } else {
+                    // Nuevos formatos: verificar cuerpo de respuestas HTML
+                    const ct = xhr.getResponseHeader?.('content-type') || '';
+                    if (ct.includes('text/html')) {
+                        const body = xhr.responseText;
+                        if (CONTENT_REGEX.test(body)) {
+                            const r = processCapturedResponse(body);
+                            if (r.success) showResult(reqUrl, r);
+                        }
+                    }
+                }
+            });
+            return xhr;
+        }
+        PatchedXHR.prototype = OrigXHR.prototype;
+        window.XMLHttpRequest = PatchedXHR;
+
+        whenBodyReady(buildUI);
+
+        // ── MODO C: detección por contenido (tipos 2/3, Nav360 y DVLineaTexto) ──
+        // Se activa cuando la página actual NO es ejr.aspx (ON_TARGET=false)
+        // pero sí contiene datos de los nuevos formatos (elementos_palabras,
+        // ProNavegacion360 o DVLineaTexto). Esto cubre la carga completa de página.
+        if (!ON_TARGET) {
+            whenBodyReady(() => {
+                const html = document.documentElement.outerHTML;
+                if (!CONTENT_REGEX.test(html)) return;
+                buildUI(); // idempotente: no crea un segundo panel
+                const result = processCapturedResponse(html);
+                if (result.success) showResult(window.location.href, result);
+            });
+        }
+    }
+
+})();
