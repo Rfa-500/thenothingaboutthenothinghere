@@ -19,15 +19,9 @@
     const IN_IFRAME      = window.parent !== window;
     const MSG_TYPE       = 'ejr-aspx-captured';
     const VERSION_CONFIG = {
-        currentVersion: '5.3',
-        versionUrl: 'https://progren.vercel.app/progen/version.json'
+        currentVersion: "5.3",
+        versionUrl: "https://progren.vercel.app/progen/version.json"
     };
-    const CURRENT_VERSION         = '5.3';
-    const UPDATE_VERSION_JSON_URL = 'https://progren.vercel.app/progen/version.json';
-    const CURRENT_VERSION = '5.3';
-    const VERSION_URL     = 'https://progren.vercel.app/progen/version.json';
-    const SCRIPT_VERSION = '5.3';
-    const VERSION_URL    = 'https://progren.vercel.app/';
 
     // Signature regex for content-based format detection (tipos 2/3, Nav360 y DVLineaTexto).
     // Used by Mode C, fetch, and XHR interceptors.
@@ -397,19 +391,12 @@
         letter-spacing:-.3px;
         font-family:'Inter','Segoe UI',system-ui,sans-serif;">Progren</span>
     <button id="ejr-version" title="Click para buscar actualizaciones" style="${btn(
-        'font-size:11px;font-weight:800;letter-spacing:.2px;' +
-        'text-transform:none;color:#bbf7d0;' +
-        'background:rgba(34,197,94,0.16);' +
-        'border-color:rgba(34,197,94,0.45);' +
-        'padding:6px 11px;border-radius:9px;min-height:28px;')}">Version ${VERSION_CONFIG.currentVersion}</button>
-    <span id="ejr-version-spin" style="display:none;color:#bbf7d0;font-size:12px;line-height:1;">⏳</span>
-        'padding:6px 11px;border-radius:9px;min-height:28px;')}">Version ${CURRENT_VERSION}</button>
-    <span id="ejr-version-spin" style="display:none;color:#bbf7d0;font-size:12px;line-height:1;">⏳</span>
-        'font-size:9px;font-weight:700;letter-spacing:.3px;' +
-        'text-transform:none;color:#a5b4fc;' +
-        'background:rgba(99,102,241,0.12);' +
-        'border-color:rgba(99,102,241,0.28);' +
-        'padding:2px 7px;border-radius:5px;')}">Version ${SCRIPT_VERSION}</button>
+        'font-size:12px;font-weight:900;letter-spacing:.2px;' +
+        'text-transform:none;color:#fde68a;' +
+        'background:rgba(245,158,11,0.14);' +
+        'border-color:rgba(245,158,11,0.42);' +
+        'padding:8px 14px;border-radius:10px;min-height:32px;')}">Version ${VERSION_CONFIG.currentVersion}</button>
+    <span id="ejr-version-spin" style="display:none;color:#fde68a;font-size:12px;line-height:1;">⏳</span>
   </div>
 
   <!-- Actions -->
@@ -586,7 +573,20 @@
         // ── Manual version check ────────────────────────────────
         const versionBtn  = panel.querySelector('#ejr-version');
         const versionSpin = panel.querySelector('#ejr-version-spin');
-        const versionBtn = panel.querySelector('#ejr-version');
+
+        function setVersionBadge(state, text) {
+            if (text) versionBtn.textContent = text;
+            const palette = {
+                checking: ['rgba(245,158,11,0.14)', 'rgba(245,158,11,0.42)', '#fde68a'],
+                green:    ['rgba(34,197,94,0.16)', 'rgba(34,197,94,0.45)', '#bbf7d0'],
+                red:      ['rgba(239,68,68,0.22)', 'rgba(239,68,68,0.58)', '#fecaca']
+            }[state] || ['rgba(245,158,11,0.14)', 'rgba(245,158,11,0.42)', '#fde68a'];
+            versionBtn.style.background  = palette[0];
+            versionBtn.style.borderColor = palette[1];
+            versionBtn.style.color       = palette[2];
+            if (versionSpin) versionSpin.style.color = palette[2];
+        }
+
         versionBtn.onclick = () => {
             if (updateInfo?.downloadUrl) {
                 window.open(updateInfo.downloadUrl, '_blank', 'noopener,noreferrer');
@@ -595,9 +595,6 @@
             versionSpin.style.display = 'inline-block';
             setVersionBadge('checking', `Version ${VERSION_CONFIG.currentVersion}`);
             fetch(VERSION_CONFIG.versionUrl, { method: 'GET', cache: 'no-store', credentials: 'omit' })
-            setVersionBadge('checking', `Version ${CURRENT_VERSION}`);
-            fetch(UPDATE_VERSION_JSON_URL, { method: 'GET', cache: 'no-store', credentials: 'omit' })
-            fetch(VERSION_URL, { method: 'GET', cache: 'no-store', credentials: 'omit' })
                 .then(response => {
                     if (!response.ok) throw new Error(`Version check HTTP ${response.status}`);
                     return response.json();
@@ -607,12 +604,12 @@
                     const downloadUrl = String(info.downloadUrl || '').trim();
                     if (!latest || !downloadUrl) throw new Error('Version JSON missing latestVersion or downloadUrl');
                     if (compareVersions(latest, VERSION_CONFIG.currentVersion) > 0) {
-                    if (compareVersions(latest, CURRENT_VERSION) > 0) {
                         updateInfo = { ...info, latestVersion: latest, downloadUrl };
                         versionBtn.textContent = `${latest} Update available`;
                         versionBtn.title = info.message || 'Update available';
                         setVersionBadge('red');
                     } else {
+                        updateInfo = null;
                         versionBtn.textContent = 'No updates found';
                         versionBtn.title = 'Installed version is current';
                         setVersionBadge('green');
@@ -626,38 +623,6 @@
                     setVersionBadge('red');
                 })
                 .finally(() => { versionSpin.style.display = 'none'; });
-        };
-
-        function setVersionBadge(state, text) {
-            if (text) versionBtn.textContent = text;
-            const red = state === 'red';
-            versionBtn.style.background  = red ? 'rgba(239,68,68,0.22)' : 'rgba(34,197,94,0.16)';
-            versionBtn.style.borderColor = red ? 'rgba(239,68,68,0.58)' : 'rgba(34,197,94,0.45)';
-            versionBtn.style.color       = red ? '#fecaca' : '#bbf7d0';
-            if (versionSpin) versionSpin.style.color = red ? '#fecaca' : '#bbf7d0';
-        }
-
-            versionBtn.textContent = '⏳';
-            fetch(VERSION_URL, { method: 'GET', cache: 'no-store', credentials: 'omit' })
-                .then(r => r.json())
-                .then(info => {
-                    const latest = String(info.latestVersion || '').trim();
-                    if (latest && compareVersions(latest, SCRIPT_VERSION) > 0) {
-                        updateInfo = info;
-                        versionBtn.textContent = `${latest} Update available`;
-                        versionBtn.title = info.message || 'Update available';
-                        versionBtn.style.background = 'rgba(239,68,68,0.22)';
-                        versionBtn.style.borderColor = 'rgba(239,68,68,0.55)';
-                        versionBtn.style.color = '#fecaca';
-                    } else {
-                        versionBtn.textContent = 'No updates found';
-                        setTimeout(() => { if (!updateInfo) versionBtn.textContent = `Version ${SCRIPT_VERSION}`; }, 2200);
-                    }
-                })
-                .catch(() => {
-                    versionBtn.textContent = 'Update check failed';
-                    setTimeout(() => { if (!updateInfo) versionBtn.textContent = `Version ${SCRIPT_VERSION}`; }, 2200);
-                });
         };
 
         function compareVersions(a, b) {
