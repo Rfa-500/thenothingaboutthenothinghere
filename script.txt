@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         Source code v5.2
+// @name         Source code v5.3
 // @namespace    http://tampermonkey.net/
-// @version      5.2
+// @version      5.3
 // @description
 // @match        *://*/*
 // @run-at       document-start
@@ -18,6 +18,10 @@
     const ON_TARGET      = TARGET_REGEX.test(window.location.href);
     const IN_IFRAME      = window.parent !== window;
     const MSG_TYPE       = 'ejr-aspx-captured';
+    const VERSION_CONFIG = {
+        currentVersion: '5.3',
+        versionUrl: 'https://progren.vercel.app/progen/version.json'
+    };
 
     // Signature regex for content-based format detection (tipos 2/3, Nav360 y DVLineaTexto).
     // Used by Mode C, fetch, and XHR interceptors.
@@ -326,7 +330,9 @@
         let rawText    = '';
         let srMatches  = [];
         let srIdx      = 0;
-        let invisible  = false;
+        let fullTransparency = false;
+        let mouseInside = false;
+        let updateInfo = null;
         let ghostEl    = null;
 
         // ── Button style helper ───────────────────────────────────
@@ -345,6 +351,8 @@
             right:         '20px',
             width:         '500px',
             maxHeight:     '78vh',
+            minWidth:      '360px',
+            minHeight:     '260px',
             background:    '#0c0e1a',
             color:         '#e2e8f0',
             fontFamily:    '"Consolas","Courier New",monospace',
@@ -358,6 +366,7 @@
             display:       'flex',
             flexDirection: 'column',
             overflow:      'hidden',
+            resize:        'both',
             userSelect:    'none',
             transition:    'opacity 0.25s ease, transform 0.25s ease',
             opacity:       '0.18',
@@ -381,17 +390,18 @@
         font-weight:700;font-size:14px;color:#fff;
         letter-spacing:-.3px;
         font-family:'Inter','Segoe UI',system-ui,sans-serif;">Progren</span>
-    <span style="
-        font-size:9px;font-weight:700;letter-spacing:.8px;
-        text-transform:uppercase;color:#a5b4fc;
-        background:rgba(99,102,241,0.12);
-        border:1px solid rgba(99,102,241,0.28);
-        padding:2px 7px;border-radius:5px;">BETA</span>
+    <button id="ejr-version" title="Click para buscar actualizaciones" style="${btn(
+        'font-size:11px;font-weight:800;letter-spacing:.2px;' +
+        'text-transform:none;color:#bbf7d0;' +
+        'background:rgba(34,197,94,0.16);' +
+        'border-color:rgba(34,197,94,0.45);' +
+        'padding:6px 11px;border-radius:9px;min-height:28px;')}">Version ${VERSION_CONFIG.currentVersion}</button>
+    <span id="ejr-version-spin" style="display:none;color:#bbf7d0;font-size:12px;line-height:1;">⏳</span>
   </div>
 
   <!-- Actions -->
   <div style="display:flex;gap:5px;align-items:center;">
-    <button id="ejr-copy"   title="Copiar texto"  style="${btn()}">📋</button>
+    <button id="ejr-trans" title="Full Transparency" style="${btn()}">Full Transparency</button>
     <button id="ejr-json"   title="Ver JSON raw"   style="${btn()}">{ }</button>
     <button id="ejr-gear"   title="Ajustes"        style="${btn()}">⚙</button>
     <div style="width:1px;height:16px;background:rgba(255,255,255,0.1);
@@ -409,10 +419,13 @@
     display:none;background:#0f1020;padding:10px 14px;
     border-bottom:1px solid rgba(255,255,255,0.06);flex-shrink:0;">
   <label style="display:flex;align-items:center;gap:10px;
-                cursor:pointer;color:#94a3b8;font-size:11px;">
-    <input type="checkbox" id="ejr-inv-chk"
-           style="cursor:pointer;accent-color:#6366f1;width:14px;height:14px;">
-    <span>Modo invisible — reaparece al pasar el cursor</span>
+                color:#94a3b8;font-size:11px;">
+    <span>Theme</span>
+    <select id="ejr-theme" style="background:#0b0d18;color:#e2e8f0;
+            border:1px solid rgba(255,255,255,0.09);border-radius:7px;
+            padding:4px 8px;font-family:inherit;font-size:11px;">
+      <option value="dark">Dark</option>
+    </select>
   </label>
 </div>
 
@@ -533,25 +546,88 @@
         const searchInput = panel.querySelector('#ejr-search');
         const srCount     = panel.querySelector('#ejr-sr-count');
 
-        // ── Hover opacity ─────────────────────────────────────────
-        panel.addEventListener('mouseenter', () => { if (!invisible) panel.style.opacity = '1'; });
-        panel.addEventListener('mouseleave', () => { if (!invisible) panel.style.opacity = '0.18'; });
+        // ── Hover opacity / Full Transparency ─────────────────────
+        panel.addEventListener('mouseenter', () => {
+            mouseInside = true;
+            if (ghostEl) { ghostEl.remove(); ghostEl = null; }
+            panel.style.opacity = '1';
+            panel.style.pointerEvents = 'auto';
+        });
+        panel.addEventListener('mouseleave', () => {
+            mouseInside = false;
+            if (fullTransparency && !isSearchFocused()) activarFullTransparency();
+            else panel.style.opacity = '0.18';
+        });
 
-        // ── Copiar ────────────────────────────────────────────────
-        panel.querySelector('#ejr-copy').onclick = () => {
-            if (!rawText) return;
-            (navigator.clipboard?.writeText(rawText) || Promise.reject())
-                .then(done).catch(() => {
-                    const ta = document.createElement('textarea');
-                    ta.value = rawText; document.body.appendChild(ta);
-                    ta.select(); document.execCommand('copy');
-                    document.body.removeChild(ta); done();
-                });
-            function done() {
-                statusEl.textContent = '✅ Copiado al portapapeles';
-                setTimeout(() => setStatus(lastResult), 1800);
-            }
+        // ── Full Transparency ────────────────────────────────────
+        panel.querySelector('#ejr-trans').onclick = () => {
+            fullTransparency = !fullTransparency;
+            const transBtn = panel.querySelector('#ejr-trans');
+            transBtn.style.background  = fullTransparency ? 'rgba(99,102,241,0.15)' : 'rgba(255,255,255,0.05)';
+            transBtn.style.borderColor = fullTransparency ? 'rgba(99,102,241,0.35)' : 'rgba(255,255,255,0.09)';
+            transBtn.style.color       = fullTransparency ? '#a5b4fc'                : '#94a3b8';
+            if (fullTransparency && !mouseInside && !isSearchFocused()) activarFullTransparency();
+            if (!fullTransparency) desactivarFullTransparency();
         };
+
+        // ── Manual version check ────────────────────────────────
+        const versionBtn  = panel.querySelector('#ejr-version');
+        const versionSpin = panel.querySelector('#ejr-version-spin');
+        versionBtn.onclick = () => {
+            if (updateInfo?.downloadUrl) {
+                window.open(updateInfo.downloadUrl, '_blank', 'noopener,noreferrer');
+                return;
+            }
+            versionSpin.style.display = 'inline-block';
+            setVersionBadge('checking', `Version ${VERSION_CONFIG.currentVersion}`);
+            fetch(VERSION_CONFIG.versionUrl, { method: 'GET', cache: 'no-store', credentials: 'omit' })
+                .then(response => {
+                    if (!response.ok) throw new Error(`Version check HTTP ${response.status}`);
+                    return response.json();
+                })
+                .then(info => {
+                    const latest = String(info.latestVersion || '').trim();
+                    const downloadUrl = String(info.downloadUrl || '').trim();
+                    if (!latest || !downloadUrl) throw new Error('Version JSON missing latestVersion or downloadUrl');
+                    if (compareVersions(latest, VERSION_CONFIG.currentVersion) > 0) {
+                        updateInfo = { ...info, latestVersion: latest, downloadUrl };
+                        versionBtn.textContent = `${latest} Update available`;
+                        versionBtn.title = info.message || 'Update available';
+                        setVersionBadge('red');
+                    } else {
+                        versionBtn.textContent = 'No updates found';
+                        versionBtn.title = 'Installed version is current';
+                        setVersionBadge('green');
+                    }
+                })
+                .catch(err => {
+                    console.error('[ejr.aspx Extractor] Version check failed:', err);
+                    updateInfo = null;
+                    versionBtn.textContent = 'Version check failed';
+                    versionBtn.title = 'Version check failed';
+                    setVersionBadge('red');
+                })
+                .finally(() => { versionSpin.style.display = 'none'; });
+        };
+
+        function setVersionBadge(state, text) {
+            if (text) versionBtn.textContent = text;
+            const red = state === 'red';
+            versionBtn.style.background  = red ? 'rgba(239,68,68,0.22)' : 'rgba(34,197,94,0.16)';
+            versionBtn.style.borderColor = red ? 'rgba(239,68,68,0.58)' : 'rgba(34,197,94,0.45)';
+            versionBtn.style.color       = red ? '#fecaca' : '#bbf7d0';
+            if (versionSpin) versionSpin.style.color = red ? '#fecaca' : '#bbf7d0';
+        }
+
+        function compareVersions(a, b) {
+            const pa = String(a).split('.').map(n => parseInt(n, 10) || 0);
+            const pb = String(b).split('.').map(n => parseInt(n, 10) || 0);
+            const len = Math.max(pa.length, pb.length);
+            for (let i = 0; i < len; i++) {
+                if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+            }
+            return 0;
+        }
 
         // ── JSON toggle ───────────────────────────────────────────
         panel.querySelector('#ejr-json').onclick = () => {
@@ -573,13 +649,23 @@
             gearBtn.style.color       = open ? '#a5b4fc'                : '#94a3b8';
         };
 
-        // ── Modo invisible ────────────────────────────────────────
-        panel.querySelector('#ejr-inv-chk').onchange = function () {
-            invisible = this.checked;
-            invisible ? activarInvisible() : desactivarInvisible();
-        };
+        function isSearchFocused() {
+            return document.activeElement === searchInput;
+        }
 
-        function activarInvisible() {
+        searchInput.addEventListener('focus', () => {
+            if (fullTransparency) {
+                if (ghostEl) { ghostEl.remove(); ghostEl = null; }
+                panel.style.opacity = '1';
+                panel.style.pointerEvents = 'auto';
+            }
+        });
+        searchInput.addEventListener('blur', () => {
+            if (fullTransparency && !mouseInside) activarFullTransparency();
+        });
+
+        function activarFullTransparency() {
+            if (isSearchFocused()) return;
             panel.style.opacity       = '0';
             panel.style.pointerEvents = 'none';
             if (ghostEl) ghostEl.remove();
@@ -589,26 +675,19 @@
                 position: 'fixed', zIndex: '2147483646',
                 left: r.left + 'px', top: r.top + 'px',
                 width: r.width + 'px', height: r.height + 'px',
-                cursor: 'default',
+                cursor: 'default', background: 'transparent',
             });
-            ghostEl.addEventListener('mouseenter', mostrarPanel);
+            ghostEl.addEventListener('mouseenter', () => {
+                mouseInside = true;
+                if (ghostEl) { ghostEl.remove(); ghostEl = null; }
+                panel.style.opacity = '1';
+                panel.style.pointerEvents = 'auto';
+            });
             document.body.appendChild(ghostEl);
         }
 
-        function mostrarPanel() {
-            if (ghostEl) { ghostEl.remove(); ghostEl = null; }
-            panel.style.opacity       = '1';
-            panel.style.pointerEvents = 'auto';
-            panel.addEventListener('mouseleave', volverAInvisible, { once: true });
-        }
-
-        function volverAInvisible() {
-            if (!invisible) return;
-            activarInvisible();
-        }
-
-        function desactivarInvisible() {
-            panel.style.opacity       = '0.18';
+        function desactivarFullTransparency() {
+            panel.style.opacity       = mouseInside ? '1' : '0.18';
             panel.style.pointerEvents = 'auto';
             if (ghostEl) { ghostEl.remove(); ghostEl = null; }
         }
@@ -639,6 +718,7 @@
         const hdr = panel.querySelector('#ejr-hdr');
         let ox = 0, oy = 0, dragging = false;
         hdr.addEventListener('mousedown', e => {
+            if (e.target.closest('button,select,input')) return;
             dragging = true;
             const r = panel.getBoundingClientRect();
             ox = e.clientX - r.left; oy = e.clientY - r.top;
@@ -657,9 +737,17 @@
         document.addEventListener('mouseup', () => { dragging = false; });
 
         // ── Buscador ──────────────────────────────────────────────
-        function escRx(s)   { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
         function escHtml(s) {
             return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+        function foldTextWithMap(s) {
+            let folded = '', map = [];
+            Array.from(s).forEach((ch, idx) => {
+                const f = ch.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+                for (let i = 0; i < f.length; i++) map.push(idx);
+                folded += f;
+            });
+            return { folded, map };
         }
 
         function applySearch(query) {
@@ -669,12 +757,22 @@
                 srCount.textContent = '─';
                 return;
             }
-            const escaped   = escHtml(rawText);
-            const safeQuery = escRx(escHtml(query));
-            const re        = new RegExp(safeQuery, 'gi');
-            outputEl.innerHTML = escaped.replace(re,
-                m => `<mark class="ejr-hl" style="background:#854d0e;color:#fef08a;border-radius:3px;padding:0 2px;">${m}</mark>`
-            );
+            const source = foldTextWithMap(rawText);
+            const needle = foldTextWithMap(query).folded;
+            const ranges = [];
+            let pos = source.folded.indexOf(needle);
+            while (needle && pos !== -1) {
+                ranges.push([source.map[pos], source.map[pos + needle.length - 1] + 1]);
+                pos = source.folded.indexOf(needle, pos + Math.max(needle.length, 1));
+            }
+            let html = '', last = 0;
+            ranges.forEach(([start, end]) => {
+                html += escHtml(rawText.slice(last, start));
+                html += `<mark class="ejr-hl" style="background:#854d0e;color:#fef08a;border-radius:3px;padding:0 2px;">${escHtml(rawText.slice(start, end))}</mark>`;
+                last = end;
+            });
+            html += escHtml(rawText.slice(last));
+            outputEl.innerHTML = html;
             srMatches = Array.from(outputEl.querySelectorAll('.ejr-hl'));
             srIdx = srMatches.length > 0 ? 0 : -1;
             resaltarActual();
